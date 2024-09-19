@@ -421,7 +421,7 @@ void loop()
     for (;;)
     {
       vTaskDelay(1);
-      if (millis() - lastMsg > 10000)
+      if (millis() - lastMsg > 60000)
       {
         myButton.TimeOut = true;
         break;
