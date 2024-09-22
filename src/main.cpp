@@ -19,6 +19,7 @@
 #define EEPROM_TARE_ADDRESS 0
 #define GrossWeight_adreess 12
 #define Gas_Type_adress 2
+#define CylinderTypeAdress 30
 #define DecimalPoint_Address 20
 
 long tareValue = 0;
@@ -46,9 +47,25 @@ constexpr uint8_t Buzzer = 4;
 constexpr uint8_t Pot = 34;
 constexpr uint8_t ConfirmButton = 35;
 constexpr uint8_t CancelButton = 10;
-double options[] = {3, 6, 12, 12.5, 15, 38}; // Available weight options
+int WorkingCylindeType = -1;
+
+struct Cylinder
+{
+  float tare;
+  float net;
+  String name;
+};
+
+// Example cylinder database (You can add more cylinders with their specifications)
+Cylinder cylinders[] = {
+    {8.6, 6.0, "14.6kg Cylinder"},  // Tare 8.6kg, Net 6.0kg (Total 14.6kg)
+    {0, 12, "12kg TestContainer"},  // Tare 0kg, Net 12.0kg (Total 12kg)
+    {14, 15, "29kg Cylinder"},      // Tare 14kg, Net 15kg (Total 29kg)
+    {15.5, 15, "30.5kg Cylinder"}}; // Tare 15.5kg, Net 15kg (Total 30.5kg)
+
 int selectedOption = 0;
 float level_percentage;
+float lpg_weight;
 
 // Load cell pins
 const int LOADCELL_DOUT_PIN = 15; // GPIO4 on ESP32
@@ -99,15 +116,13 @@ HX711 scale;
 float calibration_factor = -(312885 / 8.6);   // Adjust based on your load cell calibration
 float tare_weight = 8.4;                      // Tare weight of the empty cylinder in kg
 float net_weights = 6.0;                      // Net weight of the gas when full in kg
-float gross_weight = 0;                       // Gross weight (tare + net) in kg
+float gross_weight = 0;                       // Gross weight (tare + net) in kg                    
 float lpg_density = 0.493;                    // Density of LPG in kg/L
 float max_volume = net_weights / lpg_density; // Maximum volume of LPG cylinder in liters
 
 // Function prototype for setting tare weight
 
 uint32_t lastReconnectAttempt = 0;
-float temperature = 0;
-float humidity = 0;
 long lastMsg = 0;
 
 #ifdef DUMP_AT_COMMANDS
@@ -154,7 +169,7 @@ void mqttCallback(char *topic, byte *message, unsigned int len)
   }
 }
 
-void saveTareToEEPROM(int address, long tareValue)
+void saveDataToEEPROM(int address, long tareValue)
 {
   EEPROM.put(address, tareValue);
   EEPROM.commit(); // Save changes
@@ -165,7 +180,7 @@ void performTare()
   SerialMon.println("Performing tare...");
   scale.tare();
   tareValue = scale.get_offset();
-  saveTareToEEPROM(EEPROM_TARE_ADDRESS, tareValue);
+  saveDataToEEPROM(EEPROM_TARE_ADDRESS, tareValue);
   SerialMon.println("Tare complete and saved to EEPROM");
 }
 
@@ -228,8 +243,8 @@ void alertUser()
 void setup()
 {
   SerialMon.begin(115200);
-  pinMode(Buzzer, OUTPUT);
-  pinMode(CancelButton, INPUT);
+  // pinMode(Buzzer, OUTPUT);
+  // pinMode(CancelButton, INPUT);
   pinMode(ConfirmButton, INPUT);
   delay(10);
   Wire.begin(32, 13);
@@ -243,13 +258,18 @@ void setup()
 
   String modemInfo = modem.getModemInfo();
   SerialMon.print("Modem Info: ");
-  SerialMon.println(modemInfo);
+  // SerialMon.println(modemInfo);
 
   SerialMon.print("Connecting to APN: ");
   SerialMon.print(apn);
+  PrintToScreen(0, 0, " Connecting to ");
+  PrintToScreen(0, 1, "====INTERNET====");
   if (!modem.gprsConnect(apn, gprsUser, gprsPass))
   {
     SerialMon.println(" fail");
+    PrintToScreen(0, 0, "Failed to Connect");
+    PrintToScreen(0, 1, "RESTARTING.......");
+    delay(1500);
     ESP.restart();
   }
   else
@@ -268,7 +288,8 @@ void setup()
   scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
 
   EEPROM.begin(512);
-  // try retriving the tear weight from eeprom
+
+  // try retriving the tare weight from eeprom
   tareValue = readFromEEPROM(EEPROM_TARE_ADDRESS);
   delay(1500);
   SerialMon.print("Tare Value:  ");
@@ -286,15 +307,12 @@ void setup()
   scale.set_scale(calibration_factor); // Set the calibration factor
   myButton = {false, false};
   // load the setting
-  gross_weight = readFromEEPROM(GrossWeight_adreess);
-  delay(1000);
-  net_weights = options[readFromEEPROM(Gas_Type_adress)];
   delay(1000);
 
-  float DecimalPoints = (readFromEEPROM(DecimalPoint_Address) / 100.0);
+  WorkingCylindeType = (int)readFromEEPROM(CylinderTypeAdress);
   delay(500);
-  gross_weight = gross_weight + DecimalPoints;
-  SerialMon.println("Setting:  Gross: " + String(gross_weight) + "  " + " Gas Type: " + String(net_weights));
+  SerialMon.print("Working Value: ");
+  SerialMon.println(WorkingCylindeType);
 }
 
 void UpdateScreen(float level, float weight)
@@ -310,92 +328,80 @@ void checkTimeOut()
 
 String returnPad(int value)
 {
-  return "   " + String(options[value]) + "    Kg";
+  return cylinders[value].name;
 }
 
 void PrintSelectGas(int Selectd)
 {
-  PrintToScreen(0, 0, " =AINA YA GAS= ");
+  PrintToScreen(0, 0, "    =GAS TYPE= ");
   PrintToScreen(0, 1, returnPad(Selectd));
 }
 
-void loop()
-{
-
-  if (!mqtt.connected())
-  {
-    SerialMon.println("=== MQTT NOT CONNECTED ===");
-    uint32_t t = millis();
-    if (t - lastReconnectAttempt > 10000L)
-    {
-      lastReconnectAttempt = t;
-      if (mqttConnect())
-      {
-        lastReconnectAttempt = 0;
-      }
-    }
-    delay(100);
-    return;
-  }
-
-  if (scale.is_ready())
-  {
-    float weight = scale.get_units(10) - 3.6; // Average over 10 readings for stability
-
-    // Apply tare weight to calculate net weight
-    float net_weight = weight - (gross_weight - net_weights);
-    // Ensure net weight is not negative (for empty cylinders)
-    if (net_weight < 0)
-      net_weight = 0;
-
-    // Calculate the gas level as a percentage
-    level_percentage = (net_weight / gross_weight) * 100;
-
-    // Limit level_percentage between 0 and 100 for realistic values
-    if (level_percentage >= 100)
-      level_percentage = 100;
-    if (level_percentage <= 0)
-      level_percentage = 0;
-
-    // SerialMon.println(level_percentage);
-    // SerialMon.print("Weight: ");
-    // SerialMon.print(weight);
-    // SerialMon.println(" kg");
-    if (updateRate == 0 || updateRate > 10)
-    {
-      clearScreen();
-      UpdateScreen(level_percentage, weight < 0 ? 0 : weight);
-      updateRate = 1;
-    }
-    updateRate++;
-  }
-  else
-  {
-    SerialMon.println("HX711 not found.");
-    delay(1500);
-    return;
-  }
-
+void loop() {
   long now = millis(); // Current time in milliseconds
-  if (now - lastMsg > 50000)
-  {
-    JsonDocument doc;
+
+  // Publish data every 120 seconds
+  if (now - lastMsg > 120000) {
     lastMsg = now;
+    StaticJsonDocument<200> doc;  // Define JsonDocument
     char buffer[200];
+
+    // Adding values to JSON document
     doc["serialNumber"] = serialNumber;
     doc["levelPercentage"] = level_percentage;
-    doc["grossWeight"] = gross_weight;
-    serializeJson(doc, buffer);
-    // Temperature in Celsius
+    doc["lpg_weight"] = lpg_weight;
+    serializeJson(doc, buffer);  // Serializing JSON data to buffer
+
+    // Publish data to MQTT topic
     SerialMon.print("MyBuffer: ");
     SerialMon.println(buffer);
     mqtt.publish(topicNotification, buffer);
   }
 
-  if (myButton.ButtonPressed)
-  {
+  // Calculate average of 10 readings if a valid cylinder type is selected
+  if (WorkingCylindeType >= 0) {
+    int iteration = 0;
+    float sum = 0;
+
+    // Take 10 readings for averaging
+    while (iteration < 10) {
+      if (scale.is_ready()) {
+        float measured_weight = scale.get_units(10) - 2.93;
+        sum += measured_weight;
+        iteration++;
+        delay(100);  // Add a small delay to stabilize readings
+      }
+    }
+
+    float measured_avg_weight = sum / 10.0;
+
+    SerialMon.print("wE: ");
+    SerialMon.println(measured_avg_weight);
+
+    // Apply tare weight to calculate net weight
+    float lpg_weight = measured_avg_weight - cylinders[WorkingCylindeType].tare;
+
+    // Ensure net weight is not negative (for empty cylinders)
+    if (lpg_weight < 0)
+      lpg_weight = 0;
+
+    // Calculate the gas level as a percentage
+    level_percentage = (lpg_weight / cylinders[WorkingCylindeType].net) * 100;
+
+    // Limit level_percentage between 0 and 100 for realistic values
+    if (level_percentage > 100)
+      level_percentage = 100;
+    if (level_percentage < 0)
+      level_percentage = 0;
+
+    // Clear and update the screen with new gas level and weight
+    clearScreen();
+    UpdateScreen(level_percentage, lpg_weight);
+  }
+
+  // Handle button press for cylinder configuration
+  if (myButton.ButtonPressed) {
     int selected;
-    // setting mode
     clearScreen();
     PrintToScreen(0, 0, "  SETTING MODE ");
     delay(2000);
@@ -410,184 +416,64 @@ void loop()
     lcd.print(" View Config");
     long lastMsg = millis(); // Current time in milliseconds
 
-    struct PressedSetting
-    {
-      bool CancelButton;
+    struct PressedSetting {
       bool ConfirmButton;
     };
-    PressedSetting buttonSetting;
-    buttonSetting = {false, false};
+
+    PressedSetting buttonSetting = {false};
     clearScreen();
-    for (;;)
-    {
+
+    for (;;) {
       vTaskDelay(1);
-      if (millis() - lastMsg > 60000)
-      {
+      if (millis() - lastMsg > 60000) {  // Timeout after 60 seconds
         myButton.TimeOut = true;
         break;
       }
-      selected = map(analogRead(Pot), 0, 4095, 0, 5);
+
+      selected = map(analogRead(Pot), 0, 4095, 0, 3);  // Cylinder selection
       PrintSelectGas(selected);
-      if (!digitalRead(ConfirmButton))
-      {
-        // SerialMon.println("   ConfirmButton: ");
+
+      if (!digitalRead(ConfirmButton)) {  // Confirmation button pressed
         buttonSetting.ConfirmButton = true;
         break;
       }
-
-      if (!digitalRead(CancelButton))
-      {
-        // SerialMon.println("   Cancelling: ");
-        buttonSetting.CancelButton = true;
-        break;
-      }
     }
 
-    // checkTimeOut();
-    if (myButton.TimeOut)
-    {
+    // Handle timeout scenario
+    if (myButton.TimeOut) {
       clearScreen();
       PrintToScreen(0, 0, "    TIMEOUT  ");
       PrintToScreen(0, 1, "  PLEASE RETRY ");
-      // mqtt.loop();
       myButton.ButtonPressed = false;
       delay(1000);
       clearScreen();
-      // SerialMon.println("....");
       return;
     }
 
-    myButton.TimeOut = false;
-
-    if (buttonSetting.CancelButton)
-    {
-      // SerialMon.println(" ============================");
+    // Confirm new configuration
+    if (buttonSetting.ConfirmButton) {
+      saveDataToEEPROM(CylinderTypeAdress, selected);  // Save cylinder type to EEPROM
+      WorkingCylindeType = selected;
       clearScreen();
-      updateRate = 0;
+      PrintToScreen(0, 0, " NEW SETTING");
+      PrintToScreen(0, 1, " ---SAVED--");
+      delay(1500);
+
+      clearScreen();
       myButton.ButtonPressed = false;
       return;
-      // View last config...
-    }
-    float weight = 0;
-
-    if (buttonSetting.ConfirmButton)
-    {
-      buttonSetting.ConfirmButton = false;
-      buttonSetting.CancelButton = false;
-      // new config...
-      // SerialMon.println("jj------------");
-      long lastMsg = millis();
-      clearScreen();
-      PrintToScreen(0, 0, " PLACE CYLINDER ");
-      PrintToScreen(0, 1, " Measure gross");
-      delay(1000);
-      clearScreen();
-
-      for (;;)
-      {
-        vTaskDelay(1);
-        if (millis() - lastMsg > 20000)
-        {
-          myButton.TimeOut = true;
-          break;
-        }
-        if (scale.is_ready())
-        {
-          weight = scale.get_units(10) - 3.6; // Average over 10 readings for stability
-          PrintToScreen(0, 0, " Gross weight  ");
-          PrintToScreen(0, 1, "   " + String(weight) + "  Kg");
-          // SerialMon.println(!digitalRead(ConfirmButton));
-          // SerialMon.print(" Some mutex: ");
-          // SerialMon.println(myButton.ButtonPressed);
-          // SerialMon.println(!digitalRead(CancelButton));
-          // SerialMon.print("Weight: ");
-          // Serial.println(weight);
-          if (!digitalRead(ConfirmButton))
-          {
-            // SerialMon.println("   ConfirmButton 2222222222222222222222222: ");
-            buttonSetting.ConfirmButton = true;
-            break;
-          }
-
-          if (!digitalRead(CancelButton))
-          {
-            // SerialMon.println("   Cancelling: 2222222222222222222222");
-            buttonSetting.CancelButton = true;
-            break;
-          }
-        }
-        else
-        {
-          weight = 0;
-        }
-      }
-      // SerialMon.println("_______________////////// out please_________________");
-    }
-
-    // SerialMon.print("check this: ");
-    // SerialMon.println(buttonSetting.CancelButton);
-    // SerialMon.print("check this 2: ");
-    // SerialMon.println(buttonSetting.ConfirmButton);
-    if (myButton.TimeOut)
-    {
-      clearScreen();
-
-      if (weight == 0)
-      {
-        PrintToScreen(0, 0, "    TIMEOUT  ");
-        PrintToScreen(0, 1, "  HAMNA MTUNGI ");
-      }
-      else
-      {
-        PrintToScreen(0, 0, "    TIMEOUT  ");
-        PrintToScreen(0, 1, "  HAUJA HAKIKI");
-      }
-      // mqtt.loop();
-      myButton.ButtonPressed = false;
-      delay(1000);
-      clearScreen();
-      // SerialMon.println("....");
-      return;
-    }
-
-    if (buttonSetting.ConfirmButton)
-    {
-      // SerialMon.println("Enterd///////////////");
-      // we have to set this int eepromm
-      if (weight > 3)
-      {
-        clearScreen();
-        PrintToScreen(0, 0, " Saving Config");
-        saveTareToEEPROM(GrossWeight_adreess, double(weight));
-        delay(1500);
-        saveTareToEEPROM(Gas_Type_adress, selected);
-        delay(500);
-        int wholeNumber = (int)weight;                  // Whole number part
-        int decimalPart = (weight - wholeNumber) * 100; // Decimal part, multiplied by 100 to get 45
-        // SerialMon.println(decimalPart);
-        saveTareToEEPROM(DecimalPoint_Address, decimalPart);
-        delay(500);
-        // save & decimal
-      }
-      else
-      {
-        PrintToScreen(0, 0, " hakuna mtungi..");
-        PrintToScreen(0, 1, "  ===========");
-        delay(1000);
-      }
-    }
-    if (buttonSetting.CancelButton)
-    {
-      clearScreen();
-      PrintToScreen(0, 0, " Umesitisha  ");
-      PrintToScreen(0, 1, "   Mchakato");
-      delay(1000);
     }
 
     clearScreen();
-    updateRate = 0;
-    // SerialMon.println("___________________________________))))))___");
     myButton.ButtonPressed = false;
   }
-  mqtt.loop();
+
+  // If no valid cylinder is configured
+  if (WorkingCylindeType < 0) {
+    PrintToScreen(0, 0, " No cylinder");
+    PrintToScreen(0, 1, " Configured..");
+    delay(1500);
+  }
+
+  mqtt.loop();  // Keep the MQTT connection alive
 }
