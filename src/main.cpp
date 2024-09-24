@@ -7,20 +7,23 @@
 #include <Wire.h>
 #include <SPIFFS.h>
 #include <TinyGsmClient.h>
+#include <WiFi.h>
 #include <ArduinoJson.h>
 #include <PubSubClient.h>
 #include <LiquidCrystal_I2C.h>
 #include "HX711.h"
 #include <freertos/FreeRTOS.h>
+#include <esp_sleep.h>
+#include <esp_bt.h>
+#include <esp_wifi.h>
 #define DTR_GSM 19
 #define RX_PIN 21
 #define TX_PIN 22
 
 #define EEPROM_TARE_ADDRESS 0
-#define GrossWeight_adreess 12
-#define Gas_Type_adress 2
 #define CylinderTypeAdress 30
-#define DecimalPoint_Address 20
+#define uS_TO_S_FACTOR 1000000ULL // Conversion factor for micro seconds to seconds
+#define TIME_TO_SLEEP 3600          // Time ESP32 / 60 (minutes)
 
 long tareValue = 0;
 
@@ -75,27 +78,8 @@ struct ButtonPressedConfig
 {
   bool ButtonPressed;
   bool TimeOut;
+  bool SettingMode;
 };
-
-byte upArrow[8] = {
-    0b00100,
-    0b01110,
-    0b11111,
-    0b00100,
-    0b00100,
-    0b00100,
-    0b00000,
-    0b00000};
-
-byte downArrow[8] = {
-    0b00000,
-    0b00000,
-    0b00100,
-    0b00100,
-    0b00100,
-    0b11111,
-    0b01110,
-    0b00100};
 
 ButtonPressedConfig myButton;
 
@@ -103,9 +87,8 @@ void IRAM_ATTR attachInterruptSetup()
 {
   if (!myButton.ButtonPressed)
   {
-    myButton.ButtonPressed = true;
     myButton.TimeOut = false;
-    // SerialMon.println("Pressed....");
+    myButton.ButtonPressed = true;
   }
 }
 
@@ -116,7 +99,7 @@ HX711 scale;
 float calibration_factor = -(312885 / 8.6);   // Adjust based on your load cell calibration
 float tare_weight = 8.4;                      // Tare weight of the empty cylinder in kg
 float net_weights = 6.0;                      // Net weight of the gas when full in kg
-float gross_weight = 0;                       // Gross weight (tare + net) in kg                    
+float gross_weight = 0;                       // Gross weight (tare + net) in kg
 float lpg_density = 0.493;                    // Density of LPG in kg/L
 float max_volume = net_weights / lpg_density; // Maximum volume of LPG cylinder in liters
 
@@ -240,240 +223,399 @@ void alertUser()
   delay(2000);
 }
 
-void setup()
+void printWakeUpReason()
 {
-  SerialMon.begin(115200);
-  // pinMode(Buzzer, OUTPUT);
-  // pinMode(CancelButton, INPUT);
-  pinMode(ConfirmButton, INPUT);
-  delay(10);
-  Wire.begin(32, 13);
-  lcd.init();
-  lcd.backlight();
+  esp_sleep_wakeup_cause_t wakeup_reason;
+  wakeup_reason = esp_sleep_get_wakeup_cause();
 
-  SerialAT.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
-
-  HomeScreen();
-  delay(6000);
-
-  String modemInfo = modem.getModemInfo();
-  SerialMon.print("Modem Info: ");
-  // SerialMon.println(modemInfo);
-
-  SerialMon.print("Connecting to APN: ");
-  SerialMon.print(apn);
-  PrintToScreen(0, 0, " Connecting to ");
-  PrintToScreen(0, 1, "====INTERNET====");
-  if (!modem.gprsConnect(apn, gprsUser, gprsPass))
+  switch (wakeup_reason)
   {
-    SerialMon.println(" fail");
-    PrintToScreen(0, 0, "Failed to Connect");
-    PrintToScreen(0, 1, "RESTARTING.......");
-    delay(1500);
-    ESP.restart();
+  case ESP_SLEEP_WAKEUP_EXT0:
+    Serial.println("Wakeup caused by external signal using RTC_IO (button press)");
+    break;
+  case ESP_SLEEP_WAKEUP_TIMER:
+    Serial.println("Wakeup caused by timer");
+    break;
+  default:
+    Serial.println("Wakeup was not caused by deep sleep");
+    break;
   }
-  else
-  {
-    SerialMon.println(" OK");
-  }
-
-  if (modem.isGprsConnected())
-  {
-    SerialMon.println("GPRS connected");
-  }
-
-  attachInterrupt(ConfirmButton, attachInterruptSetup, RISING);
-  mqtt.setServer(broker, 1883);
-  mqtt.setCallback(mqttCallback);
-  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
-
-  EEPROM.begin(512);
-
-  // try retriving the tare weight from eeprom
-  tareValue = readFromEEPROM(EEPROM_TARE_ADDRESS);
-  delay(1500);
-  SerialMon.print("Tare Value:  ");
-  SerialMon.println(tareValue);
-  if (tareValue == 0)
-  {
-    performTare();
-  }
-  else
-  {
-    scale.set_offset(tareValue); // Set the stored tare value
-    SerialMon.println("Tare value loaded from EEPROM");
-  }
-
-  scale.set_scale(calibration_factor); // Set the calibration factor
-  myButton = {false, false};
-  // load the setting
-  delay(1000);
-
-  WorkingCylindeType = (int)readFromEEPROM(CylinderTypeAdress);
-  delay(500);
-  SerialMon.print("Working Value: ");
-  SerialMon.println(WorkingCylindeType);
 }
 
 void UpdateScreen(float level, float weight)
 {
   PrintToScreen(0, 0, " UZITO: " + String(weight) + " kg");
-
   PrintToScreen(0, 1, " KWNGO: " + String(level) + " %");
-}
-
-void checkTimeOut()
-{
-}
-
-String returnPad(int value)
-{
-  return cylinders[value].name;
 }
 
 void PrintSelectGas(int Selectd)
 {
   PrintToScreen(0, 0, "    =GAS TYPE= ");
-  PrintToScreen(0, 1, returnPad(Selectd));
+  PrintToScreen(0, 1, cylinders[Selectd].name);
 }
 
-void loop() {
-  long now = millis(); // Current time in milliseconds
+void ComputeAndShow(bool display)
+{
 
-  // Publish data every 120 seconds
-  if (now - lastMsg > 120000) {
-    lastMsg = now;
-    StaticJsonDocument<200> doc;  // Define JsonDocument
-    char buffer[200];
+  int iteration = 0;
+  float sum = 0;
+  clearScreen();
+  PrintToScreen(0, 0, " =COMPUTING=");
 
-    // Adding values to JSON document
-    doc["serialNumber"] = serialNumber;
-    doc["levelPercentage"] = level_percentage;
-    doc["lpg_weight"] = lpg_weight;
-    serializeJson(doc, buffer);  // Serializing JSON data to buffer
-
-    // Publish data to MQTT topic
-    SerialMon.print("MyBuffer: ");
-    SerialMon.println(buffer);
-    mqtt.publish(topicNotification, buffer);
+  // Take 10 readings for averaging
+  while (iteration < 10)
+  {
+    String progres = "   .";
+    if (scale.is_ready())
+    {
+      float measured_weight = scale.get_units(10) - 2.93;
+      sum += measured_weight;
+      iteration++;
+      progres = progres + ".";
+      PrintToScreen(0, 1, progres);
+      delay(100); // Add a small delay to stabilize readings
+    }
   }
 
-  // Calculate average of 10 readings if a valid cylinder type is selected
-  if (WorkingCylindeType >= 0) {
-    int iteration = 0;
-    float sum = 0;
+  float measured_avg_weight = sum / 10.0;
 
-    // Take 10 readings for averaging
-    while (iteration < 10) {
-      if (scale.is_ready()) {
-        float measured_weight = scale.get_units(10) - 2.93;
-        sum += measured_weight;
-        iteration++;
-        delay(100);  // Add a small delay to stabilize readings
-      }
-    }
+  SerialMon.print("wE: ");
+  SerialMon.println(measured_avg_weight);
 
-    float measured_avg_weight = sum / 10.0;
+  // Apply tare weight to calculate net weight
+  float lpg_weight = measured_avg_weight - cylinders[WorkingCylindeType].tare;
 
-    SerialMon.print("wE: ");
-    SerialMon.println(measured_avg_weight);
+  // Ensure net weight is not negative (for empty cylinders)
+  if (lpg_weight < 0)
+    lpg_weight = 0;
 
-    // Apply tare weight to calculate net weight
-    float lpg_weight = measured_avg_weight - cylinders[WorkingCylindeType].tare;
+  // Calculate the gas level as a percentage
+  level_percentage = (lpg_weight / cylinders[WorkingCylindeType].net) * 100;
 
-    // Ensure net weight is not negative (for empty cylinders)
-    if (lpg_weight < 0)
-      lpg_weight = 0;
+  // Limit level_percentage between 0 and 100 for realistic values
 
-    // Calculate the gas level as a percentage
-    level_percentage = (lpg_weight / cylinders[WorkingCylindeType].net) * 100;
+  if (level_percentage > 100)
+    level_percentage = 100;
+  if (level_percentage < 0)
+    level_percentage = 0;
 
-    // Limit level_percentage between 0 and 100 for realistic values
-    if (level_percentage > 100)
-      level_percentage = 100;
-    if (level_percentage < 0)
-      level_percentage = 0;
-
-    // Clear and update the screen with new gas level and weight
+  // Clear and update the screen with new gas level and weight
+  if (display)
+  {
     clearScreen();
     UpdateScreen(level_percentage, lpg_weight);
   }
+}
 
-  // Handle button press for cylinder configuration
-  if (myButton.ButtonPressed) {
-    int selected;
-    clearScreen();
-    PrintToScreen(0, 0, "  SETTING MODE ");
-    delay(2000);
-    clearScreen();
-    lcd.setCursor(0, 0);
-    lcd.write(byte(0));
-    lcd.setCursor(2, 0);
-    lcd.print(" New Config");
-    lcd.setCursor(0, 1);
-    lcd.write(byte(1));
-    lcd.setCursor(2, 1);
-    lcd.print(" View Config");
-    long lastMsg = millis(); // Current time in milliseconds
+void ButtonSettingFunc()
+{
 
-    struct PressedSetting {
-      bool ConfirmButton;
-    };
+  int selected;
+  clearScreen();
+  PrintToScreen(0, 0, "  SETTING MODE ");
+  delay(2000);
+  clearScreen();
+  lcd.setCursor(0, 0);
+  lcd.write(byte(0));
+  lcd.setCursor(2, 0);
+  lcd.print(" New Config");
+  lcd.setCursor(0, 1);
+  lcd.write(byte(1));
+  lcd.setCursor(2, 1);
+  lcd.print(" View Config");
+  long lastMsg = millis(); // Current time in milliseconds
 
-    PressedSetting buttonSetting = {false};
-    clearScreen();
+  struct PressedSetting
+  {
+    bool ConfirmButton;
+  };
 
-    for (;;) {
-      vTaskDelay(1);
-      if (millis() - lastMsg > 60000) {  // Timeout after 60 seconds
-        myButton.TimeOut = true;
-        break;
-      }
-
-      selected = map(analogRead(Pot), 0, 4095, 0, 3);  // Cylinder selection
-      PrintSelectGas(selected);
-
-      if (!digitalRead(ConfirmButton)) {  // Confirmation button pressed
-        buttonSetting.ConfirmButton = true;
-        break;
-      }
+  PressedSetting buttonSetting = {false};
+  clearScreen();
+  for (;;)
+  {
+    vTaskDelay(1);
+    if (millis() - lastMsg > 60000)
+    { // Timeout after 60 seconds
+      myButton.TimeOut = true;
+      break;
     }
 
-    // Handle timeout scenario
-    if (myButton.TimeOut) {
-      clearScreen();
-      PrintToScreen(0, 0, "    TIMEOUT  ");
-      PrintToScreen(0, 1, "  PLEASE RETRY ");
-      myButton.ButtonPressed = false;
-      delay(1000);
-      clearScreen();
-      return;
+    selected = map(analogRead(Pot), 0, 4095, 0, sizeof(cylinders)/sizeof(Cylinder)); // Cylinder selection
+    PrintSelectGas(selected);
+
+    if (!digitalRead(CancelButton))
+    { // Confirmation button pressed
+      buttonSetting.ConfirmButton = true;
+      break;
     }
+  }
 
-    // Confirm new configuration
-    if (buttonSetting.ConfirmButton) {
-      saveDataToEEPROM(CylinderTypeAdress, selected);  // Save cylinder type to EEPROM
-      WorkingCylindeType = selected;
-      clearScreen();
-      PrintToScreen(0, 0, " NEW SETTING");
-      PrintToScreen(0, 1, " ---SAVED--");
-      delay(1500);
+  // Handle timeout scenario
+  if (myButton.TimeOut)
+  {
+    clearScreen();
+    PrintToScreen(0, 0, "    TIMEOUT  ");
+    PrintToScreen(0, 1, "  PLEASE RETRY ");
+    myButton.ButtonPressed = false;
+    delay(1000);
+    clearScreen();
+    return;
+  }
 
-      clearScreen();
-      myButton.ButtonPressed = false;
-      return;
-    }
-
+  // Confirm new configuration
+  if (buttonSetting.ConfirmButton)
+  {
+    saveDataToEEPROM(CylinderTypeAdress, selected); // Save cylinder type to EEPROM
+    WorkingCylindeType = selected;
+    clearScreen();
+    PrintToScreen(0, 0, " NEW SETTING");
+    PrintToScreen(0, 1, " ---SAVED--");
+    delay(1500);
     clearScreen();
     myButton.ButtonPressed = false;
+    return;
   }
 
-  // If no valid cylinder is configured
-  if (WorkingCylindeType < 0) {
-    PrintToScreen(0, 0, " No cylinder");
-    PrintToScreen(0, 1, " Configured..");
-    delay(1500);
+  clearScreen();
+  myButton.ButtonPressed = false;
+}
+
+void setup()
+{
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  esp_wifi_stop();
+  btStop();
+  SerialMon.begin(115200);
+  EEPROM.begin(512);
+
+  // pinMode(Buzzer, OUTPUT);
+  pinMode(CancelButton, INPUT);
+  pinMode(ConfirmButton, INPUT);
+  delay(10);
+  SerialAT.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
+
+  printWakeUpReason();
+  Wire.begin(32, 13);
+  lcd.init();
+  lcd.noBacklight();
+  pinMode(DTR_GSM, OUTPUT);
+  modem.sendAT("+CSCLK=1");
+
+  delay(1000);
+  digitalWrite(DTR_GSM, LOW);
+
+  if (modem.sleepEnable(true))
+  {
+    SerialMon.println("Modem went to sleep");
+  }
+  else
+  {
+    SerialMon.println("Failed to sleep Gsm.");
   }
 
-  mqtt.loop();  // Keep the MQTT connection alive
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER)
+  {
+    // send data to server
+    WorkingCylindeType = (int)readFromEEPROM(CylinderTypeAdress);
+    delay(500);
+    if (WorkingCylindeType >= 0)
+    {
+      if (modem.sleepEnable(false))
+      {
+        SerialMon.println("Testing ");
+      }
+      SerialMon.println(" I am sending data after wakeup from the timer output");
+      delay(6000);
+      String modemInfo = modem.getModemInfo();
+      SerialMon.print("Modem Info: ");
+      SerialMon.print("Connecting to APN: ");
+      SerialMon.print(apn);
+      PrintToScreen(0, 0, " Connecting to ");
+      PrintToScreen(0, 1, "====INTERNET====");
+      if (!modem.gprsConnect(apn, gprsUser, gprsPass))
+      {
+        SerialMon.println(" fail");
+        PrintToScreen(0, 0, "Failed to Connect");
+        PrintToScreen(0, 1, "RESTARTING.......");
+        delay(1500);
+        ESP.restart();
+      }
+      else
+      {
+        SerialMon.println(" OK");
+      }
+
+      if (modem.isGprsConnected())
+      {
+        SerialMon.println("GPRS connected");
+      }
+
+      mqtt.setServer(broker, 1883);
+      mqtt.setCallback(mqttCallback);
+      scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+
+      while (true)
+      {
+        if (!mqtt.connected())
+        {
+          SerialMon.println("=== MQTT NOT CONNECTED ===");
+          uint32_t t = millis();
+          if (t - lastReconnectAttempt > 10000L)
+          {
+            lastReconnectAttempt = t;
+            if (mqttConnect())
+            {
+              lastReconnectAttempt = 0;
+            }
+          }
+        }
+        if (mqtt.connected())
+        {
+          break;
+        }
+      }
+
+      // try retriving the tare weight from eeprom
+      tareValue = readFromEEPROM(EEPROM_TARE_ADDRESS);
+      delay(1500);
+      SerialMon.print("Tare Value:  ");
+      SerialMon.println(tareValue);
+      if (tareValue == 0)
+      {
+        performTare();
+      }
+      else
+      {
+        scale.set_offset(tareValue); // Set the stored tare value
+        SerialMon.println("Tare value loaded from EEPROM");
+      }
+
+      scale.set_scale(calibration_factor); // Set the calibration factor
+      myButton = {false, false, false};
+      // load the setting
+      delay(1000);
+      ComputeAndShow(false);
+      DynamicJsonDocument doc(512); // Define a larger JsonDocument
+      char buffer[512];             // Increased buffer size
+
+      doc["serialNumber"] = serialNumber; // Add your variables
+      doc["levelPercentage"] = level_percentage;
+      doc["lpg_weight"] = lpg_weight;
+
+      serializeJson(doc, buffer); // Serializing JSON data to buffer
+
+      // Print the serialized JSON to Serial Monitor for verification
+      SerialMon.print("Serialized Buffer: ");
+      SerialMon.println(buffer);
+
+      // Check MQTT connection before publishing
+      if (mqtt.connected())
+      {
+        // Try publishing the message and check if it succeeds
+        bool success = mqtt.publish(topicNotification, buffer);
+        if (success)
+        {
+          SerialMon.println("MQTT Publish Successful");
+        }
+        else
+        {
+          SerialMon.println("MQTT Publish Failed");
+        }
+      }
+      else
+      {
+        SerialMon.println("MQTT not connected");
+      }
+      mqtt.loop(); // Keep the MQTT connection alive
+      delay(3000);
+      modem.sleepEnable(true);
+       modem.sendAT("+CSCLK=1");
+
+  delay(1000);
+  digitalWrite(DTR_GSM, LOW);
+  delay(1000);
+
+    }
+  }
+
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0)
+  {
+    lcd.backlight();
+    HomeScreen();
+    bool SettingMode = false;
+    long lastTime = millis();
+    for (;;)
+    {
+      if (millis() - lastTime >= 3000)
+      {
+        break;
+      }
+      if (!digitalRead(CancelButton))
+      {
+        SettingMode = true;
+        break;
+      }
+    }
+    WorkingCylindeType = (int)readFromEEPROM(CylinderTypeAdress);
+    delay(500);
+    SerialMon.print("Mode:  ");
+    SerialMon.println(SettingMode);
+    if (!SettingMode)
+    {
+      if (WorkingCylindeType)
+      {
+        scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+
+        // try retriving the tare weight from eeprom
+        tareValue = readFromEEPROM(EEPROM_TARE_ADDRESS);
+        delay(1500);
+        SerialMon.print("Tare Value:  ");
+        SerialMon.println(tareValue);
+        if (tareValue == 0)
+        {
+          performTare();
+        }
+        else
+        {
+          scale.set_offset(tareValue); // Set the stored tare value
+          SerialMon.println("Tare value loaded from EEPROM");
+        }
+
+        scale.set_scale(calibration_factor); // Set the calibration factor
+        myButton = {false, false, false};
+        delay(1000);
+
+        SerialMon.print("Working Value: ");
+        SerialMon.println(WorkingCylindeType);
+        ComputeAndShow(true);
+        delay(20000); //
+      }
+      else
+      {
+        PrintToScreen(0, 0, " No cylinder");
+        PrintToScreen(0, 1, " Configured..");
+        delay(1500);
+      }
+    }
+    else
+    {
+      ButtonSettingFunc();
+    }
+  }
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_35, 0);
+  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+  lcd.noBacklight();
+  lcd.noDisplay();
+
+  // Go to deep sleep
+  Serial.println("Going to sleep now...");
+  delay(1000);
+  esp_deep_sleep_start(); // Enter deep sleep
+  // register handlers for
+}
+
+void loop()
+{
 }
