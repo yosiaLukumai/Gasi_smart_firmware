@@ -23,7 +23,7 @@
 #define EEPROM_TARE_ADDRESS 0
 #define CylinderTypeAdress 30
 #define uS_TO_S_FACTOR 1000000ULL // Conversion factor for micro seconds to seconds
-#define TIME_TO_SLEEP 3600          // Time ESP32 / 60 (minutes)
+#define TIME_TO_SLEEP 1800          // Time ESP32 / 60 (minutes)
 
 long tareValue = 0;
 
@@ -51,6 +51,7 @@ constexpr uint8_t Pot = 34;
 constexpr uint8_t ConfirmButton = 35;
 constexpr uint8_t CancelButton = 10;
 int WorkingCylindeType = -1;
+float lpg_weight;
 
 struct Cylinder
 {
@@ -68,7 +69,6 @@ Cylinder cylinders[] = {
 
 int selectedOption = 0;
 float level_percentage;
-float lpg_weight;
 
 // Load cell pins
 const int LOADCELL_DOUT_PIN = 15; // GPIO4 on ESP32
@@ -263,7 +263,7 @@ void ComputeAndShow(bool display)
   PrintToScreen(0, 0, " =COMPUTING=");
 
   // Take 10 readings for averaging
-  while (iteration < 10)
+  for (;;)
   {
     String progres = "   .";
     if (scale.is_ready())
@@ -271,19 +271,25 @@ void ComputeAndShow(bool display)
       float measured_weight = scale.get_units(10) - 2.93;
       sum += measured_weight;
       iteration++;
-      progres = progres + ".";
+      progres += ".";
       PrintToScreen(0, 1, progres);
       delay(100); // Add a small delay to stabilize readings
+
+    }
+    if(iteration>=10) {
+      break;
     }
   }
-
+  
   float measured_avg_weight = sum / 10.0;
+  SerialMon.print("Measured sum: ");
+  SerialMon.println(sum);
 
   SerialMon.print("wE: ");
   SerialMon.println(measured_avg_weight);
 
   // Apply tare weight to calculate net weight
-  float lpg_weight = measured_avg_weight - cylinders[WorkingCylindeType].tare;
+  lpg_weight = measured_avg_weight - cylinders[WorkingCylindeType].tare;
 
   // Ensure net weight is not negative (for empty cylinders)
   if (lpg_weight < 0)
@@ -300,6 +306,8 @@ void ComputeAndShow(bool display)
     level_percentage = 0;
 
   // Clear and update the screen with new gas level and weight
+  SerialMon.print("level: ");
+  SerialMon.println(level_percentage);
   if (display)
   {
     clearScreen();
@@ -497,8 +505,8 @@ void setup()
       // load the setting
       delay(1000);
       ComputeAndShow(false);
-      DynamicJsonDocument doc(512); // Define a larger JsonDocument
-      char buffer[512];             // Increased buffer size
+      JsonDocument doc; // Define a larger JsonDocument
+      char buffer[200];             // Increased buffer size
 
       doc["serialNumber"] = serialNumber; // Add your variables
       doc["levelPercentage"] = level_percentage;
