@@ -425,34 +425,52 @@ void setup()
 
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER)
   {
-    // send data to server
+    // Read cylinder type from EEPROM
     WorkingCylindeType = (int)readFromEEPROM(CylinderTypeAdress);
-    delay(500);
+    delay(500); // Short delay to ensure EEPROM is read correctly
+
     if (WorkingCylindeType >= 0)
     {
       if (modem.sleepEnable(false))
       {
-        SerialMon.println("Testing ");
+        SerialMon.println("Modem waking up... ");
+        delay(2000);
       }
       SerialMon.println(" I am sending data after wakeup from the timer output");
-      delay(6000);
       String modemInfo = modem.getModemInfo();
       SerialMon.print("Modem Info: ");
+      SerialMon.println(modemInfo);
+
+      
       SerialMon.print("Connecting to APN: ");
       SerialMon.print(apn);
       PrintToScreen(0, 0, " Connecting to ");
       PrintToScreen(0, 1, "====INTERNET====");
-      if (!modem.gprsConnect(apn, gprsUser, gprsPass))
+
+      //Retry connecting to GPRS
+      int retryCount = 0;
+      const int maxRetries = 3;
+
+      while (!modem.gprsConnect(apn, gprsUser, gprsPass) && retryCount < maxRetries)
       {
-        SerialMon.println(" fail");
-        PrintToScreen(0, 0, "Failed to Connect");
+        SerialMon.println("Connection failed. Retrying...");
+        PrintToScreen(0,0,"Retrying....");
+        retryCount++;
+        delay(2000); // Wait 3 seconds before retrying
+      }
+
+      if (retryCount == maxRetries)
+      {
+        SerialMon.println(" Failed to connect after retries. Restarting...");
+        PrintToScreen(0, 0, "Failed after retries");
         PrintToScreen(0, 1, "RESTARTING.......");
         delay(1500);
         ESP.restart();
       }
       else
       {
-        SerialMon.println(" OK");
+        SerialMon.println(" Connected successfully!");
+        PrintToScreen(0,0," Connected! ");
       }
 
       if (modem.isGprsConnected())
